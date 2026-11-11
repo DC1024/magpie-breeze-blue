@@ -1,28 +1,34 @@
 // Magpie 的 Breeze Blue provider 插件接线：config/auth/provider 三个 hook，
 // 具体的请求映射与 HTTP 逻辑都在 lib/breeze.mjs。
-// 每日签到（auth.checkin）走的是 Web 端会话 cookie，逻辑在 lib/checkin.mjs。
+// 每日签到（auth.checkin）走的是 Web 端会话 cookie，逻辑在 lib/checkin.mjs，
+// 浏览器取 cookie 的流程在 lib/browser-login.mjs。
 import {
   BALANCE_PLAN,
   BREEZE_BASE_URL,
   breezeBalance,
   createBreezeSpeechFetch,
 } from './lib/breeze.mjs'
-import { claimDailyCredits } from './lib/checkin.mjs'
+import { claimDailyCredits, normalizeCookie, verifyCookie } from './lib/checkin.mjs'
+import { loginWithBrowser } from './lib/browser-login.mjs'
 
 const PROVIDER_ID = 'breeze'
 const MODEL_ID = 'breeze-tts-2'
 
-// 登录时让用户粘贴 Breeze Blue 网页会话 cookie；Magpie 会将其作为 OAuth 凭证保存在自己的 plugin-auth.json。
-// 这不是 API Key。Breeze 当前使用 Firebase 登录，未来可用完整浏览器流程替换粘贴式登录。
-function normalizeCookie(raw) {
-  if (typeof raw !== 'string') return null
-  let cookie = raw.trim().replace(/^cookie\s*:\s*/i, '')
-  if (!cookie || /[\r\n]/.test(cookie)) return null
-  return cookie
-}
-
+// 会话 cookie 存在 auth.access / auth.metadata.cookie，两种都读。
 function resolveCheckinCookie(auth) {
   return normalizeCookie(auth?.metadata?.cookie ?? auth?.cookie ?? auth?.access ?? '')
+}
+
+// 登录成功后交给 Magpie 的凭据形状。expires 只是让宿主别主动淘汰；
+// 真正的判据是上游 401，届时 checkin 会返回 signIn: "expired"。
+function cookieCredential(cookie) {
+  return {
+    type: 'success',
+    access: cookie,
+    refresh: '',
+    expires: Date.now() + 360 * 24 * 3600 * 1000,
+    metadata: { cookie },
+  }
 }
 
 function modelDeclaration() {
@@ -60,10 +66,44 @@ export default async function breezePlugin() {
       methods: [
         { type: 'api', label: 'Breeze API key', placeholder: 'brz_…' },
         {
-          // Magpie 会把 authorize 返回的 OAuth 凭证保存到 plugin-auth.json。
-          // 不在 authorize 里联网；校验放 callback，避免阻塞宿主的登录流程。
+          // 一键登录：拉起本机 Chromium 内核浏览器，用户在里面登录一次，
+          // 插件用 CDP 读回 cookie 并自动完成登录。profile 持久化，
+          // 所以第二次点直接就能读到，不用重新输密码。
           type: 'oauth',
-          label: 'Breeze 网页 Cookie（每日签到）',
+          label: '浏览器登录（推荐，点一下即可）',
+          async authorize(_inputs, context) {
+            const signal = context?.signal
+            // 立即返回，真正的等待放在 callback 里，否则会和宿主互锁。
+            const pending = loginWithBrowser({
+              signal,
+              verify: async (cookie) => (await verifyCookie(cookie)).ok,
+              log: (line) => console.log(`[breeze] ${line}`),
+            })
+
+            return {
+              url: 'https://breezeblue.ai/app/home',
+              instructions:
+                '已打开 Breeze 登录窗口：登录完成后会自动读取登录态，无需复制任何东西。窗口会在成功后自动关闭。',
+              method: 'auto',
+              opened: true,
+              async callback() {
+                let result
+                try {
+                  result = await pending
+                } catch (error) {
+                  return { type: 'failed', error: String(error?.message ?? error) }
+                }
+                if (!result.ok) return { type: 'failed', error: result.error }
+                return cookieCredential(result.cookie)
+              },
+            }
+          },
+        },
+        {
+          // 兜底：没有 Chromium 浏览器、或在别人的机器上临时用时，
+          // 从 DevTools 复制整行 cookie 粘进来。纯 HTTP 校验。
+          type: 'oauth',
+          label: '粘贴 Cookie 登录',
           prompts: [{
             type: 'text',
             key: 'cookie',
@@ -73,6 +113,7 @@ export default async function breezePlugin() {
           }],
           async authorize(inputs) {
             const cookie = normalizeCookie(inputs?.cookie)
+            // 失败只能 throw：return { type: 'failed' } 会被宿主当成登录流程去调 .callback()。
             if (!cookie) throw new Error('请输入有效的单行 Cookie')
             return {
               url: 'https://breezeblue.ai/app/home',
@@ -80,29 +121,9 @@ export default async function breezePlugin() {
               method: 'auto',
               opened: true,
               async callback() {
-                const summary = await fetch('https://breezeblue.ai/api/credits/summary', {
-                  headers: {
-                    cookie,
-                    accept: 'application/json, text/plain, */*',
-                    origin: 'https://breezeblue.ai',
-                    referer: 'https://breezeblue.ai/app/home',
-                  },
-                }).catch((error) => ({ status: 0, error }))
-                if (summary.status === 401 || summary.status === 403) {
-                  return { type: 'failed', error: 'Breeze 网页 Cookie 无效或已过期' }
-                }
-                if (summary.status !== 200) {
-                  return { type: 'failed', error: `Breeze 登录态验证失败：HTTP ${summary.status || 'network error'}` }
-                }
-                return {
-                  type: 'success',
-                  access: cookie,
-                  refresh: '',
-                  // Web 会话实际有效期由服务端决定；这里仅避免 Magpie 主动过早淘汰。
-                  // 401/403 会在 checkin 时返回 signIn: "expired"。
-                  expires: Date.now() + 360 * 24 * 3600 * 1000,
-                  metadata: { cookie },
-                }
+                const check = await verifyCookie(cookie)
+                if (!check.ok) return { type: 'failed', error: check.reason }
+                return cookieCredential(cookie)
               },
             }
           },
@@ -125,14 +146,28 @@ export default async function breezePlugin() {
       },
 
       // 余额只用于 Magpie 的 provider 卡片/usage；任何失败都变成 error 文本。
+      // 注意：用「浏览器登录」的用户只有会话 cookie、没有 API key，
+      // 这种情况不该报 "not signed in"——他只是没配 key，签到照样能用。
       async usage(getAuth) {
         try {
           const auth = await getAuth()
-          const usage = await breezeBalance(auth?.key)
+          const key = typeof auth?.key === 'string' ? auth.key.trim() : ''
+          if (!key) {
+            const hasCookie = Boolean(resolveCheckinCookie(auth))
+            return {
+              plan: BALANCE_PLAN,
+              windows: hasCookie
+                ? [{ name: '每日积分', display: '由每日签到自动领取', aside: true }]
+                : [],
+              error: hasCookie ? undefined : '未配置 Breeze API key，余额不可查',
+            }
+          }
+
+          const usage = await breezeBalance(key)
           if (Array.isArray(usage.windows) && usage.windows.length > 0) {
             usage.windows.push({
               name: '每日积分',
-              display: '在 breezeblue.ai/app 手动领取',
+              display: '由每日签到自动领取',
               aside: true,
             })
           }
@@ -146,23 +181,28 @@ export default async function breezePlugin() {
         }
       },
 
-      // Magpie 每个北京日对每个已登录账调用一次（受 设置→用量→插件 的每日签到开关控制）。
+      // Magpie 每个北京日对每个已登录账号调用一次（受 设置→用量→插件 的每日签到开关控制）。
       // 返回 { outcome, credit?, streak?, message?, until? }，outcome 只认
       // claimed / done / ineligible / inactive / captcha / failed。
-      // 只有 failed 会在当天 30 分钟后重试，所以「cookie 过期」这类不该重试的情况
-      // 一律报 ineligible，避免一天被重试几十次。
+      // 只有 failed 会在当天 30 分钟后重试，所以「会话失效」不该用 failed，
+      // 否则一天会被重试几十次；改用 signIn: "expired" 让宿主标记账号需要重新登录。
       async checkin(getAuth) {
         let auth
         try {
           auth = await getAuth()
         } catch {
-          return { outcome: 'ineligible', message: '未登录 Breeze 网页签到账号' }
+          return { outcome: 'ineligible', message: '未登录 Breeze 网页账号' }
         }
         const cookie = resolveCheckinCookie(auth)
         if (!cookie) {
+          // 区分「完全没登录」和「只配了 API key」：后者是常见误区，
+          // TTS 的 key 不能用来签到，得单独走一次浏览器登录。
+          const hasKey = typeof auth?.key === 'string' && auth.key.trim()
           return {
             outcome: 'ineligible',
-            message: '未配置 Breeze 网页 Cookie：请先登录“Breeze 网页 Cookie（每日签到）”账号',
+            message: hasKey
+              ? '当前账号只有 API key，签到需要网页登录态：请再用「浏览器登录」方式添加一个账号'
+              : '未登录 Breeze 网页账号：请用「浏览器登录」方式登录一次',
           }
         }
 

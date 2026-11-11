@@ -1,7 +1,7 @@
 {
   "name": "magpie-breeze-blue",
-  "version": "0.3.0",
-  "description": "Breeze Blue TTS provider plugin for Magpie, with daily credit check-in",
+  "version": "0.4.0",
+  "description": "Breeze Blue TTS provider plugin for Magpie, with one-click browser login and daily credit check-in",
   "type": "module",
   "main": "./index.mjs",
   "files": [
@@ -39,8 +39,8 @@
   "magpie": {
     "name": "BreezeBlue",
     "summary": {
-      "en": "Breeze Blue text-to-speech with daily credit check-in.",
-      "zh": "Breeze Blue 文本转语音，附带每日积分自动领取。"
+      "en": "Breeze Blue text-to-speech with one-click browser login and daily credit check-in.",
+      "zh": "Breeze Blue 文本转语音，浏览器一键登录，附带每日积分自动领取。"
     },
     "icon": "https://breezeblue.ai/favicon.png"
   }

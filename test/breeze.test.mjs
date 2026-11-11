@@ -402,7 +402,7 @@ test('auth.loader 返回 baseURL 并注入 Breeze fetch', async () => {
   }
 })
 
-test('auth.usage 用 Breeze 余额生成 Magpie window，并提示每日积分手动领取', async () => {
+test('auth.usage 用 Breeze 余额生成 Magpie window，并说明每日积分由签到自动领取', async () => {
   const original = globalThis.fetch
   const fake = recorder(() => jsonResponse({ balance: 1635.6, settlement_pending: false }))
   globalThis.fetch = fake.fetch
@@ -414,7 +414,7 @@ test('auth.usage 用 Breeze 余额生成 Magpie window，并提示每日积分�
       plan: BALANCE_PLAN,
       windows: [
         { name: BALANCE_NAME, balance: 1635.6, unit: BALANCE_UNIT },
-        { name: '每日积分', display: '在 breezeblue.ai/app 手动领取', aside: true },
+        { name: '每日积分', display: '由每日签到自动领取', aside: true },
       ],
     })
     assert.equal(fake.calls[0].url, `${BREEZE_BASE_URL}/balance`)
@@ -444,4 +444,50 @@ test('auth.usage 失败不抛到 Magpie 外层', async () => {
   } finally {
     globalThis.fetch = original
   }
+})
+
+// 用浏览器登录的账号只有会话 cookie、没有 API key。
+// 此时不该报 "not signed in"，否则用户会以为登录失败了。
+test('auth.usage 只有 cookie 时提示签到已就绪，不报未登录', async () => {
+  const hooks = await breezePlugin()
+  const usage = await hooks.auth.usage(async () => ({
+    type: 'success',
+    access: 'sid=abc',
+    metadata: { cookie: 'sid=abc' },
+  }))
+
+  assert.equal(usage.plan, BALANCE_PLAN)
+  assert.deepEqual(usage.windows, [{ name: '每日积分', display: '由每日签到自动领取', aside: true }])
+  assert.equal(usage.error, undefined)
+})
+
+test('auth.usage 既无 key 也无 cookie 时说明缺 key', async () => {
+  const hooks = await breezePlugin()
+  const usage = await hooks.auth.usage(async () => ({}))
+  assert.deepEqual(usage.windows, [])
+  assert.match(usage.error, /API key/)
+})
+
+// TTS 的 key 不能用来签到，这是最常见的误区，文案要能指出来。
+test('auth.checkin 只有 API key 时提示需要网页登录态', async () => {
+  const hooks = await breezePlugin()
+  const result = await hooks.auth.checkin(async () => ({ type: 'api', key: 'brz_x' }))
+  assert.equal(result.outcome, 'ineligible')
+  assert.match(result.message, /浏览器登录/)
+})
+
+test('auth.checkin 完全没有登录态时提示登录', async () => {
+  const hooks = await breezePlugin()
+  const result = await hooks.auth.checkin(async () => ({}))
+  assert.equal(result.outcome, 'ineligible')
+  assert.match(result.message, /浏览器登录/)
+})
+
+test('auth.checkin getAuth 抛错时不把异常漏给宿主', async () => {
+  const hooks = await breezePlugin()
+  const result = await hooks.auth.checkin(async () => {
+    throw new Error('no auth')
+  })
+  assert.equal(result.outcome, 'ineligible')
+  assert.equal(typeof result.message, 'string')
 })
