@@ -77,8 +77,13 @@ export default async function breezePlugin() {
             const pending = loginWithBrowser({
               signal,
               verify: async (cookie) => (await verifyCookie(cookie)).ok,
-              log: (line) => console.log(`[breeze] ${line}`),
+              // 写 stderr 而不是 stdout：宿主的 stdout 是它与 magpie 的通信通道，
+              // 插件不该往上面写任何东西。
+              log: (line) => console.error(`[breeze] ${line}`),
             })
+            // 宿主放弃登录（取消 / 超时）时不会调用 callback，这个 Promise 就没人接管。
+            // 未处理的 reject 会让 Bun 直接以 exit 1 退出整个插件宿主，所以这里兜一层。
+            pending.catch(() => {})
 
             return {
               url: 'https://breezeblue.ai/app/home',

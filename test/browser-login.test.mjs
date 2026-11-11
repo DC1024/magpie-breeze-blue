@@ -233,3 +233,85 @@ test('loginWithBrowser cookie 没变化时不重复验证', async () => {
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// 回归：spawn 失败不是抛异常，而是异步 emit 'error'。
+// 没监听时 Node/Bun 会把它升级成未捕获异常，整个插件宿主以 exit 1 退出
+// （用户看到的就是「the plugin host quit: exit status 1」）。
+test('loginWithBrowser 接住 spawn 的异步 error 事件，不弄死宿主', async () => {
+  const dir = tempProfile()
+  const { EventEmitter } = await import('node:events')
+  // 真实 ChildProcess 是 EventEmitter，spawn 失败时 emit('error')。
+  const fakeChild = new EventEmitter()
+  fakeChild.kill = () => {}
+
+  try {
+    const promise = loginWithBrowser({
+      exists: () => true,
+      platform: 'win32',
+      env: { ProgramFiles: 'C://blocked' },
+      dir,
+      timeoutMs: 3000,
+      spawnImpl: () => fakeChild,
+    })
+
+    // 模拟 spawn 异步失败（ENOENT / 被安全软件拦截）
+    const error = new Error('spawn chrome.exe EACCES')
+    error.code = 'EACCES'
+    setTimeout(() => fakeChild.emit('error', error), 30)
+
+    const result = await promise
+    assert.equal(result.ok, false)
+    assert.match(result.error, /权限|安全软件|粘贴 Cookie/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('loginWithBrowser 对 spawn 失败的 ENOENT 给出可操作提示', async () => {
+  const dir = tempProfile()
+  const { EventEmitter } = await import('node:events')
+  const fakeChild = new EventEmitter()
+  fakeChild.kill = () => {}
+
+  try {
+    const promise = loginWithBrowser({
+      exists: () => true,
+      platform: 'win32',
+      env: { ProgramFiles: 'C://nope' },
+      dir,
+      timeoutMs: 3000,
+      spawnImpl: () => fakeChild,
+    })
+    const error = new Error('spawn chrome.exe ENOENT')
+    error.code = 'ENOENT'
+    setTimeout(() => fakeChild.emit('error', error), 30)
+
+    const result = await promise
+    assert.equal(result.ok, false)
+    assert.match(result.error, /MAGPIE_BREEZE_BROWSER/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('loginWithBrowser 内部异常也返回对象，不 reject', async () => {
+  const dir = tempProfile()
+  try {
+    const result = await loginWithBrowser({
+      exists: () => true,
+      platform: 'win32',
+      env: { ProgramFiles: 'C://x' },
+      dir,
+      timeoutMs: 1500,
+      // spawn 返回的对象连 on 都没有，最坏情况
+      spawnImpl: () => null,
+      verify: () => {
+        throw new Error('verify boom')
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(typeof result.error, 'string')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

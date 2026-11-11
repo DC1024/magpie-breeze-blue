@@ -1,6 +1,6 @@
 {
   "name": "magpie-breeze-blue",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Breeze Blue TTS provider plugin for Magpie, with one-click browser login and daily credit check-in",
   "type": "module",
   "main": "./index.mjs",
