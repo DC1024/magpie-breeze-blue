@@ -9,7 +9,10 @@ import {
   cookiesToHeader,
   findChromium,
   loginWithBrowser,
+  normalizeCdpBase,
   parseDevToolsActivePort,
+  readCookiesViaCdp,
+  rewriteWsUrl,
 } from '../lib/browser-login.mjs'
 
 // 每个用例一个独立临时目录，避免在真实磁盘上留垃圾，也避免用例互相污染。
@@ -216,10 +219,8 @@ test('loginWithBrowser cookie 没变化时不重复验证', async () => {
         writeFileSync(portFile, '19333\n/devtools/browser/x\n')
         return { kill: () => {} }
       },
-      fetchImpl: async () => ({
-        ok: true,
-        json: async () => [{ type: 'page', url: 'https://breezeblue.ai/app/home', webSocketDebuggerUrl: 'ws://x' }],
-      }),
+      // 调试端口的探测走 httpGet（node:http 直连，绕开 Bun fetch 的代理劫持）
+      httpGet: async () => [{ type: 'page', url: 'https://breezeblue.ai/app/home', webSocketDebuggerUrl: 'ws://x' }],
       verify: async () => {
         verifyCalls += 1
         return false
@@ -311,6 +312,267 @@ test('loginWithBrowser 内部异常也返回对象，不 reject', async () => {
     })
     assert.equal(result.ok, false)
     assert.equal(typeof result.error, 'string')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// 回归：Linux 下不能想当然返回第一个候选名。NAS 上只有 google-chrome-stable，
+// 没有 google-chrome，旧实现会拿着不存在的命令去 spawn 并报 ENOENT。
+test('findChromium 在 Linux 下按 PATH 解析出真实存在的命令', () => {
+  const found = findChromium({
+    platform: 'linux',
+    env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+    exists: (p) => p === '/usr/bin/google-chrome-stable',
+  })
+  assert.equal(found, '/usr/bin/google-chrome-stable')
+})
+
+test('findChromium 在 Linux 下找不到任何浏览器时返回空串', () => {
+  const found = findChromium({
+    platform: 'linux',
+    env: { PATH: '/usr/bin:/bin' },
+    exists: () => false,
+  })
+  assert.equal(found, '')
+})
+
+test('findChromium 在 Linux 下用 POSIX 拼接，不受宿主平台影响', () => {
+  // 即使测试跑在 Windows 上，Linux 分支也必须拼出正斜杠路径
+  const found = findChromium({
+    platform: 'linux',
+    env: { PATH: '/opt/bin' },
+    exists: (p) => {
+      assert.ok(!p.includes('\\'), `路径不该有反斜杠: ${p}`)
+      return p === '/opt/bin/chromium'
+    },
+  })
+  assert.equal(found, '/opt/bin/chromium')
+})
+
+test('findChromium 优先用 MAGPIE_BREEZE_BROWSER 指定的绝对路径', () => {
+  const found = findChromium({
+    platform: 'linux',
+    env: { PATH: '/usr/bin', MAGPIE_BREEZE_BROWSER: '/custom/chrome' },
+    exists: (p) => p === '/custom/chrome',
+  })
+  assert.equal(found, '/custom/chrome')
+})
+
+// ---------- 远程模式（Magpie 装在 NAS / 服务器，浏览器在用户自己电脑上）----------
+
+test('normalizeCdpBase 接受多种写法', () => {
+  assert.equal(normalizeCdpBase('127.0.0.1:9222'), 'http://127.0.0.1:9222')
+  assert.equal(normalizeCdpBase('http://127.0.0.1:9222'), 'http://127.0.0.1:9222')
+  assert.equal(normalizeCdpBase('http://127.0.0.1:9222/json/list'), 'http://127.0.0.1:9222')
+  // 用户从 chrome://inspect 抄下来的 ws 地址
+  assert.equal(normalizeCdpBase('ws://127.0.0.1:9222/devtools/browser/abc'), 'http://127.0.0.1:9222')
+  assert.equal(normalizeCdpBase('  192.168.43.96:9222  '), 'http://192.168.43.96:9222')
+  assert.equal(normalizeCdpBase(''), '')
+  assert.equal(normalizeCdpBase('   '), '')
+  assert.equal(normalizeCdpBase('http://'), '')
+})
+
+// 走 SSH 隧道时，浏览器自报的 ws 地址是它自己视角的 127.0.0.1:9222，
+// 插件这边必须换成隧道端口，否则连的是本机（不存在）的 9222。
+test('rewriteWsUrl 把浏览器自报的 host:port 换成实际可达地址', () => {
+  assert.equal(
+    rewriteWsUrl('ws://127.0.0.1:9222/devtools/browser/abc', 'http://127.0.0.1:19222'),
+    'ws://127.0.0.1:19222/devtools/browser/abc',
+  )
+  // https 端点要跟着变成 wss
+  assert.equal(
+    rewriteWsUrl('ws://127.0.0.1:9222/devtools/browser/abc', 'https://nas.local:443'),
+    'wss://nas.local/devtools/browser/abc',
+  )
+  // 垃圾输入不炸
+  assert.equal(rewriteWsUrl('', 'http://127.0.0.1:9222'), '')
+})
+
+test('readCookiesViaCdp 优先用浏览器级 Storage.getCookies', async () => {
+  const realWebSocket = globalThis.WebSocket
+  let sentMethod = ''
+  class FakeSocket {
+    constructor() {
+      setTimeout(() => {
+        this.onopen?.()
+      }, 0)
+    }
+    send(payload) {
+      sentMethod = JSON.parse(payload).method
+      setTimeout(() => {
+        this.onmessage?.({
+          data: JSON.stringify({
+            id: 1,
+            result: { cookies: [{ name: 'sid', value: 'v', domain: '.breezeblue.ai', path: '/' }] },
+          }),
+        })
+      }, 0)
+    }
+    close() {}
+  }
+  globalThis.WebSocket = FakeSocket
+  try {
+    const cookies = await readCookiesViaCdp('http://127.0.0.1:9222', {
+      httpGet: async (url) => {
+        if (url.endsWith('/json/version')) {
+          return { Browser: 'Chrome/157', webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/browser/x' }
+        }
+        // 不该走到这里：浏览器级已成功
+        throw new Error(`unexpected ${url}`)
+      },
+    })
+    assert.equal(sentMethod, 'Storage.getCookies')
+    assert.equal(cookies.length, 1)
+    assert.equal(cookies[0].name, 'sid')
+  } finally {
+    globalThis.WebSocket = realWebSocket
+  }
+})
+
+test('readCookiesViaCdp 老浏览器不支持 Storage 时退回页面级 getAllCookies', async () => {
+  const realWebSocket = globalThis.WebSocket
+  const methods = []
+  let call = 0
+  class FakeSocket {
+    constructor() {
+      setTimeout(() => this.onopen?.(), 0)
+    }
+    send(payload) {
+      const method = JSON.parse(payload).method
+      methods.push(method)
+      call += 1
+      setTimeout(() => {
+        // 第一次（Storage.getCookies）回错误，模拟老版本不支持
+        const message = call === 1
+          ? { id: 1, error: { code: -32601, message: 'method not found' } }
+          : { id: 1, result: { cookies: [{ name: 'p', value: '1', domain: 'breezeblue.ai' }] } }
+        this.onmessage?.({ data: JSON.stringify(message) })
+      }, 0)
+    }
+    close() {}
+  }
+  globalThis.WebSocket = FakeSocket
+  try {
+    const cookies = await readCookiesViaCdp('http://127.0.0.1:9222', {
+      httpGet: async (url) => {
+        if (url.endsWith('/json/version')) return { Browser: 'Chrome/100', webSocketDebuggerUrl: 'ws://x/1' }
+        return [{ type: 'page', url: 'https://breezeblue.ai/app/home', webSocketDebuggerUrl: 'ws://x/2' }]
+      },
+    })
+    assert.deepEqual(methods, ['Storage.getCookies', 'Network.getAllCookies'])
+    assert.equal(cookies[0].name, 'p')
+  } finally {
+    globalThis.WebSocket = realWebSocket
+  }
+})
+
+// 远程模式的核心：绝不能去 spawn 浏览器。
+// NAS 上 spawn 出来的窗口开在 NAS 自己的显示器上，用户看不到，等于必然失败。
+test('loginWithBrowser 传 cdpUrl 时不启动浏览器', async () => {
+  const realWebSocket = globalThis.WebSocket
+  let spawnCalls = 0
+  class FakeSocket {
+    constructor() {
+      setTimeout(() => this.onopen?.(), 0)
+    }
+    send() {
+      setTimeout(() => {
+        this.onmessage?.({
+          data: JSON.stringify({
+            id: 1,
+            result: { cookies: [{ name: 'sid', value: 'ok', domain: '.breezeblue.ai', path: '/' }] },
+          }),
+        })
+      }, 0)
+    }
+    close() {}
+  }
+  globalThis.WebSocket = FakeSocket
+  try {
+    const result = await loginWithBrowser({
+      cdpUrl: '127.0.0.1:19222',
+      // 即使这里有可用的浏览器也不该用
+      exists: () => true,
+      platform: 'win32',
+      env: { ProgramFiles: 'C://PF' },
+      timeoutMs: 4000,
+      pollMs: 100,
+      spawnImpl: () => {
+        spawnCalls += 1
+        return { kill: () => {} }
+      },
+      httpGet: async (url) => {
+        if (url.endsWith('/json/version')) return { Browser: 'Chrome/157', webSocketDebuggerUrl: 'ws://x/1' }
+        throw new Error('should not be called')
+      },
+      verify: async () => true,
+    })
+    assert.equal(spawnCalls, 0, '远程模式不该启动浏览器')
+    assert.equal(result.ok, true)
+    assert.equal(result.cookie, 'sid=ok')
+    assert.equal(result.browser, 'http://127.0.0.1:19222')
+  } finally {
+    globalThis.WebSocket = realWebSocket
+  }
+})
+
+test('loginWithBrowser 远程模式连不上时给出排查步骤', async () => {
+  const result = await loginWithBrowser({
+    cdpUrl: '127.0.0.1:19222',
+    timeoutMs: 600,
+    pollMs: 100,
+    httpGet: async () => null,
+    spawnImpl: () => ({ kill: () => {} }),
+  })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /连不上/)
+  assert.match(result.error, /remote-debugging-port/)
+  assert.match(result.error, /隧道/)
+})
+
+test('loginWithBrowser 远程模式地址非法时直接拒绝', async () => {
+  const result = await loginWithBrowser({ cdpUrl: 'http://', timeoutMs: 500 })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /调试地址格式/)
+})
+
+// Linux 上没有 DISPLAY 时浏览器起来就退，窗口画不出来。
+// 与其让用户盯着 5 分钟超时，不如立刻告诉他该怎么做。
+test('loginWithBrowser 在无图形界面的 Linux 上直接给出替代方案', async () => {
+  const result = await loginWithBrowser({
+    platform: 'linux',
+    env: { PATH: '/usr/bin' },
+    exists: () => true,
+    timeoutMs: 3000,
+    spawnImpl: () => {
+      throw new Error('不该走到 spawn')
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /图形界面|DISPLAY/)
+  assert.match(result.error, /远程|粘贴 Cookie/)
+})
+
+test('loginWithBrowser 有 DISPLAY 的 Linux 仍走本地模式', async () => {
+  const dir = tempProfile()
+  let spawnCalls = 0
+  try {
+    const result = await loginWithBrowser({
+      platform: 'linux',
+      env: { PATH: '/usr/bin', DISPLAY: ':0' },
+      exists: (p) => p === '/usr/bin/google-chrome-stable',
+      dir,
+      timeoutMs: 700,
+      pollMs: 100,
+      spawnImpl: () => {
+        spawnCalls += 1
+        return { kill: () => {} }
+      },
+    })
+    assert.equal(spawnCalls, 1, '有 DISPLAY 就该真的去启动浏览器')
+    // 浏览器没写 DevToolsActivePort，所以是端口超时
+    assert.match(result.error, /调试端口|超时/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

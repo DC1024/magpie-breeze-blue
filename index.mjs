@@ -9,7 +9,7 @@ import {
   createBreezeSpeechFetch,
 } from './lib/breeze.mjs'
 import { claimDailyCredits, normalizeCookie, verifyCookie } from './lib/checkin.mjs'
-import { loginWithBrowser } from './lib/browser-login.mjs'
+import { LOGIN_URL, loginWithBrowser, normalizeCdpBase } from './lib/browser-login.mjs'
 
 const PROVIDER_ID = 'breeze'
 const MODEL_ID = 'breeze-tts-2'
@@ -40,6 +40,47 @@ function modelDeclaration() {
   }
 }
 
+// 把「跑一次 loginWithBrowser」包装成 Magpie 的 oauth method。
+// 关键约束：authorize 必须立即返回，等待放在 callback 里，否则会和宿主互锁。
+// instructions 支持传函数，用于把用户填的地址回显进去。
+function browserLoginMethod({ label, instructions, opened = true, options = () => ({}) }) {
+  return {
+    type: 'oauth',
+    label,
+    async authorize(inputs, context) {
+      const signal = context?.signal
+      const pending = loginWithBrowser({
+        signal,
+        verify: async (cookie) => (await verifyCookie(cookie)).ok,
+        // 写 stderr 而不是 stdout：宿主的 stdout 是它与 magpie 的通信通道，
+        // 插件不该往上面写任何东西。
+        log: (line) => console.error(`[breeze] ${line}`),
+        ...options(inputs),
+      })
+      // 宿主放弃登录（取消 / 超时）时不会调用 callback，这个 Promise 就没人接管。
+      // 未处理的 reject 会让 Bun 直接以 exit 1 退出整个插件宿主，所以这里兜一层。
+      pending.catch(() => {})
+
+      return {
+        url: LOGIN_URL,
+        instructions: typeof instructions === 'function' ? instructions(inputs) : instructions,
+        method: 'auto',
+        opened,
+        async callback() {
+          let result
+          try {
+            result = await pending
+          } catch (err) {
+            return { type: 'failed', error: String(err?.message ?? err) }
+          }
+          if (!result.ok) return { type: 'failed', error: result.error }
+          return cookieCredential(result.cookie)
+        },
+      }
+    },
+  }
+}
+
 // Magpie 会把模块导出的函数都当作插件，因此这里只导出默认工厂。
 export default async function breezePlugin() {
   return {
@@ -64,45 +105,43 @@ export default async function breezePlugin() {
     auth: {
       provider: PROVIDER_ID,
       methods: [
-        { type: 'api', label: 'Breeze API key', placeholder: 'brz_…' },
         {
-          // 一键登录：拉起本机 Chromium 内核浏览器，用户在里面登录一次，
-          // 插件用 CDP 读回 cookie 并自动完成登录。profile 持久化，
-          // 所以第二次点直接就能读到，不用重新输密码。
-          type: 'oauth',
+          type: 'api',
+          label: 'Breeze API key',
+          placeholder: 'brz_…',
+        },
+        // 本机模式：Magpie 和你用的是同一台电脑时最省事——点一下弹浏览器，登录完自动读回 cookie。
+        browserLoginMethod({
           label: '浏览器登录（推荐，点一下即可）',
-          async authorize(_inputs, context) {
-            const signal = context?.signal
-            // 立即返回，真正的等待放在 callback 里，否则会和宿主互锁。
-            const pending = loginWithBrowser({
-              signal,
-              verify: async (cookie) => (await verifyCookie(cookie)).ok,
-              // 写 stderr 而不是 stdout：宿主的 stdout 是它与 magpie 的通信通道，
-              // 插件不该往上面写任何东西。
-              log: (line) => console.error(`[breeze] ${line}`),
-            })
-            // 宿主放弃登录（取消 / 超时）时不会调用 callback，这个 Promise 就没人接管。
-            // 未处理的 reject 会让 Bun 直接以 exit 1 退出整个插件宿主，所以这里兜一层。
-            pending.catch(() => {})
-
-            return {
-              url: 'https://breezeblue.ai/app/home',
-              instructions:
-                '已打开 Breeze 登录窗口：登录完成后会自动读取登录态，无需复制任何东西。窗口会在成功后自动关闭。',
-              method: 'auto',
-              opened: true,
-              async callback() {
-                let result
-                try {
-                  result = await pending
-                } catch (error) {
-                  return { type: 'failed', error: String(error?.message ?? error) }
-                }
-                if (!result.ok) return { type: 'failed', error: result.error }
-                return cookieCredential(result.cookie)
-              },
-            }
-          },
+          instructions:
+            '已打开 Breeze 登录窗口：登录完成后会自动读取登录态，无需复制任何东西。窗口会在成功后自动关闭。',
+        }),
+        // 远程模式：Magpie 跑在 NAS / 服务器上，浏览器在你自己的电脑上。
+        // 这时插件进程 spawn 出来的窗口开在 NAS 那块屏幕上，你根本看不到，
+        // 所以改成「连你电脑上 Chrome 的调试端口」。
+        {
+          ...browserLoginMethod({
+            label: '远程浏览器登录（Magpie 装在 NAS / 服务器时用）',
+            // 浏览器已经开在用户电脑上了，不该再让宿主去开一个
+            opened: false,
+            options: (inputs) => ({ cdpUrl: normalizeCdpBase(inputs?.cdp) || 'http://127.0.0.1:9222' }),
+            instructions: (inputs) => {
+              const cdp = normalizeCdpBase(inputs?.cdp) || 'http://127.0.0.1:9222'
+              return (
+                `正在连你电脑上的 Chrome（${cdp}）。请在那个 Chrome 里登录 Breeze，` +
+                '登录成功后会自动读取登录态。注意：窗口在你自己的电脑上，不在 NAS 上。'
+              )
+            },
+          }),
+          prompts: [
+            {
+              type: 'text',
+              key: 'cdp',
+              message: '在你电脑上启动带调试端口的 Chrome，然后填它的地址',
+              placeholder: '127.0.0.1:9222',
+              validate: (value) => (normalizeCdpBase(value) ? undefined : '填成 主机:端口 或 http://主机:端口'),
+            },
+          ],
         },
         {
           // 兜底：没有 Chromium 浏览器、或在别人的机器上临时用时，

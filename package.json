@@ -1,12 +1,13 @@
 {
   "name": "magpie-breeze-blue",
-  "version": "0.4.1",
-  "description": "Breeze Blue TTS provider plugin for Magpie, with one-click browser login and daily credit check-in",
+  "version": "0.5.0",
+  "description": "Breeze Blue TTS provider plugin for Magpie, with browser login (local or remote via SSH tunnel) and daily credit check-in",
   "type": "module",
   "main": "./index.mjs",
   "files": [
     "index.mjs",
     "lib/",
+    "scripts/",
     "README.md",
     "LICENSE"
   ],
@@ -23,7 +24,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "remote-login": "node scripts/remote-login.mjs"
   },
   "keywords": [
     "magpie",
