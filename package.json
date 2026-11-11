@@ -1,0 +1,47 @@
+{
+  "name": "magpie-breeze-blue",
+  "version": "0.3.0",
+  "description": "Breeze Blue TTS provider plugin for Magpie, with daily credit check-in",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "LumenMarch",
+  "contributors": [
+    "DC1024"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DC1024/magpie-breeze-blue.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode-plugin",
+    "breeze",
+    "breezeblue",
+    "tts",
+    "text-to-speech",
+    "provider",
+    "checkin"
+  ],
+  "magpie": {
+    "name": "BreezeBlue",
+    "summary": {
+      "en": "Breeze Blue text-to-speech with daily credit check-in.",
+      "zh": "Breeze Blue 文本转语音，附带每日积分自动领取。"
+    },
+    "icon": "https://breezeblue.ai/favicon.png"
+  }
+}
