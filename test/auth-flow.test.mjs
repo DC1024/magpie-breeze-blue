@@ -1,79 +1,243 @@
 // index.mjs 里 auth 方法的接线契约。
 //
-// 这组用例守的是 v0.6.0 的核心结论：**登录页由 magpie 打开，插件不 spawn 浏览器**。
-// 网页版的 openSignInPage 是 window.open(url)，桌面版是系统浏览器
-// （internal/gui/assets/app.js、internal/gui/api.go 的 openSignIn），
-// 所以只要 authorize 把地址交回去、opened 留 false，页面就开在用户自己电脑上。
-// 一旦有人把 opened 改成 true，NAS 部署就又变回「窗口开在 NAS 那块屏幕上」——这里会红。
+// 这里守三件事：
+//   1. 邮箱密码方法排在第一位，且是「不开页面、不粘东西」的 auto 流程；
+//   2. 粘贴方法仍然是 opened:false + method:'code'（登录页由 magpie 开在用户浏览器里，
+//      见 internal/gui/assets/app.js 的 openSignInPage）——防止退回 v0.5.0 的隧道方案；
+//   3. 只有带 refresh token 的账号才写 expires，否则宿主会去续期一个没凭据可续的账号。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import plugin from '../index.mjs'
 import { LOGIN_PAGE_URL } from '../lib/browser-login.mjs'
 
-// 插件工厂是纯函数，每个用例拿一份新的 hooks。
 async function hooks() {
   return await plugin()
 }
 
-// 把 globalThis.fetch 换成受控的桩，记下每次请求。
-// verifyCookie 用的是默认的 globalThis.fetch，所以这里能拦住。
-function stubFetch(reply) {
+// 按 label 找方法，别用下标：方法顺序以后还会变。
+function methodOf(auth, label) {
+  const m = auth.methods.find((x) => String(x.label ?? '').includes(label))
+  assert.ok(m, `找不到「${label}」方法，现有：${auth.methods.map((x) => x.label).join(' / ')}`)
+  return m
+}
+
+// 一个按路径分发的假 fetch，同时覆盖插件自己的请求和 verifyCookie 的。
+function stubFetch(routes) {
   const real = globalThis.fetch
   const calls = []
   globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), headers: init.headers ?? {} })
-    const r = typeof reply === 'function' ? reply(String(url), init) : reply
-    return new Response(JSON.stringify(r.body ?? {}), {
-      status: r.status ?? 200,
-      headers: { 'content-type': 'application/json' },
-    })
+    const u = String(url)
+    calls.push({ url: u, method: init.method ?? 'GET', body: init.body })
+    for (const [match, reply] of routes) {
+      if (match(u)) {
+        const r = typeof reply === 'function' ? await reply(u, init) : reply
+        return new Response(JSON.stringify(r.body ?? {}), {
+          status: r.status ?? 200,
+          headers: r.headers ?? { 'content-type': 'application/json' },
+        })
+      }
+    }
+    throw new Error(`unexpected request: ${u}`)
   }
   return { calls, restore: () => { globalThis.fetch = real } }
 }
 
-test('第一个登录方法是「magpie 打开登录页 + 粘贴」', async () => {
-  const { auth } = await hooks()
-  const m = auth.methods[0]
-  assert.equal(m.type, 'oauth')
+function cookieHeaders(...lines) {
+  const headers = new Headers({ 'content-type': 'application/json' })
+  for (const line of lines) headers.append('set-cookie', line)
+  return headers
+}
 
+const isConfig = (u) => u.endsWith('/api/config')
+const isIdentity = (u) => u.includes('identitytoolkit')
+const isExchange = (u) => u.endsWith('/api/auth/firebase')
+const isSummary = (u) => u.endsWith('/api/credits/summary')
+const isClaim = (u) => u.endsWith('/api/credits/daily-claim')
+const isRefresh = (u) => u.includes('securetoken')
+
+// ---------- 方法清单 ----------
+
+test('邮箱密码排第一，旧的三种都还在', async () => {
+  const { auth } = await hooks()
+  assert.match(String(auth.methods[0].label), /密码/)
+  for (const label of ['浏览器登录', '本机自动', '直接粘贴']) {
+    methodOf(auth, label)
+  }
+  // API key 那条是给 TTS 用的，不能丢（丢了 loader 取不到 auth.key，TTS 直接 401）
+  const api = auth.methods.filter((m) => m.type === 'api')
+  assert.equal(api.length, 1)
+  assert.match(String(api[0].label), /API key/)
+})
+
+test('邮箱密码方法提供的两个问题里，密码是掩码类型', async () => {
+  const { auth } = await hooks()
+  const m = methodOf(auth, '密码')
+  assert.equal(m.type, 'oauth')
+  assert.equal(m.prompts.length, 2)
+  assert.equal(m.prompts[0].key, 'email')
+  assert.equal(m.prompts[1].key, 'password')
+  // magpie 自己的 prompt 类型；写成 text 密码就会明文显示
+  assert.equal(m.prompts[1].type, 'password')
+  // 校验器要真的拦住空值
+  assert.equal(m.prompts[1].validate('  '), '请输入密码')
+  assert.equal(m.prompts[1].validate('x'), undefined)
+  assert.ok(m.prompts[0].validate('no-at-sign'))
+  assert.equal(m.prompts[0].validate('a@b.c'), undefined)
+})
+
+// ---------- 邮箱密码在线路里的形状 ----------
+
+test('邮箱密码登录成功后交出带续期凭据的账号，且不打开任何页面', async () => {
+  const { auth } = await hooks()
+  const m = methodOf(auth, '密码')
+
+  const s = stubFetch([
+    [isConfig, { body: { firebase_api_key: 'K', auth_enabled: true } }],
+    [isIdentity, { body: { idToken: 'ID', refreshToken: 'RT', localId: 'L', email: 'a@b.c' } }],
+    [isExchange, { body: { ok: true }, headers: cookieHeaders('breeze_session=s1; Path=/; Max-Age=7200', 'breeze_uid=u1; Path=/; Max-Age=7200') }],
+    [isSummary, { body: { credits: 5 } }],
+  ])
+  try {
+    const a = await m.authorize({ email: ' a@b.c ', password: 'pw' }, {})
+
+    // 没有页面要开：url 空串，前端不会 window.open，也不会渲染「打开链接」
+    assert.equal(a.url, '')
+    assert.equal(a.opened, true)
+    assert.equal(a.method, 'auto')
+    assert.match(a.instructions, /a@b\.c/)
+
+    const cred = await a.callback()
+    assert.equal(cred.type, 'success')
+    assert.equal(cred.access, 'breeze_session=s1; breeze_uid=u1')
+    // 这两样是「能不能永不掉线」的关键
+    assert.equal(cred.refresh, 'RT')
+    assert.ok(cred.expires > Date.now() + 7000 * 1000)
+    assert.equal(cred.metadata.cookie, 'breeze_session=s1; breeze_uid=u1')
+    assert.equal(cred.metadata.firebaseRefreshToken, 'RT')
+    assert.equal(cred.metadata.apiKey, 'K')
+    // 密码一个字都不该出现在凭据里
+    assert.doesNotMatch(JSON.stringify(cred), /"pw"/)
+  } finally {
+    s.restore()
+  }
+})
+
+test('密码错时 authorize 直接抛，界面才能显示原因', async () => {
+  const { auth } = await hooks()
+  const m = methodOf(auth, '密码')
+  const s = stubFetch([
+    [isConfig, { body: { firebase_api_key: 'K', auth_enabled: true } }],
+    [isIdentity, { status: 400, body: { error: { message: 'INVALID_LOGIN_CREDENTIALS' } } }],
+  ])
+  try {
+    await assert.rejects(() => m.authorize({ email: 'a@b.c', password: 'wrong' }, {}), /邮箱或密码不对/)
+  } finally {
+    s.restore()
+  }
+})
+
+test('换会话没拿到 cookie 时给出可上报的报错', async () => {
+  const { auth } = await hooks()
+  const m = methodOf(auth, '密码')
+  const s = stubFetch([
+    [isConfig, { body: { firebase_api_key: 'K', auth_enabled: true } }],
+    [isIdentity, { body: { idToken: 'ID', refreshToken: 'RT' } }],
+    [isExchange, { body: { ok: true, access_token: 'secret-ish' } }],
+  ])
+  try {
+    await assert.rejects(() => m.authorize({ email: 'a@b.c', password: 'pw' }, {}), /没下发会话 cookie/)
+  } finally {
+    s.restore()
+  }
+})
+
+// ---------- 续期钩子 ----------
+
+test('refresh 钩子用 refresh token 换新 cookie 并轮换凭据', async () => {
+  const { auth } = await hooks()
+  const s = stubFetch([
+    [isConfig, { body: { firebase_api_key: 'K2', auth_enabled: true } }],
+    [isRefresh, { body: { id_token: 'ID9', refresh_token: 'RT9' } }],
+    [isExchange, { body: { ok: true }, headers: cookieHeaders('breeze_session=s9; Path=/; Max-Age=1800') }],
+    [isSummary, { body: { credits: 1 } }],
+  ])
+  try {
+    const kept = await auth.refresh({
+      type: 'oauth',
+      access: 'breeze_session=old',
+      refresh: 'RT',
+      expires: Date.now(),
+      metadata: { cookie: 'breeze_session=old', user: 'a@b.c' },
+    })
+    assert.equal(kept.access, 'breeze_session=s9')
+    assert.equal(kept.refresh, 'RT9')
+    assert.ok(kept.expires > Date.now())
+    // metadata 要合并，别把 user 之类的旧字段冲掉
+    assert.equal(kept.metadata.user, 'a@b.c')
+    assert.equal(kept.metadata.cookie, 'breeze_session=s9')
+  } finally {
+    s.restore()
+  }
+})
+
+test('没有 refresh token 的账号不该被续期', async () => {
+  const { auth } = await hooks()
+  const kept = await auth.refresh({ type: 'oauth', access: 'sid=x', refresh: '', metadata: { cookie: 'sid=x' } })
+  assert.equal(kept, undefined)
+})
+
+test('续期凭据作废时抛 signIn:expired，宿主才会标记重新登录', async () => {
+  const { auth } = await hooks()
+  const s = stubFetch([
+    [isConfig, { body: { firebase_api_key: 'K', auth_enabled: true } }],
+    [isRefresh, { status: 400, body: { error: { message: 'INVALID_REFRESH_TOKEN' } } }],
+  ])
+  try {
+    await assert.rejects(
+      () => auth.refresh({ type: 'oauth', access: 's', refresh: 'RT', expires: Date.now() }),
+      (error) => error.signIn === 'expired' && /重新登录/.test(error.message),
+    )
+  } finally {
+    s.restore()
+  }
+})
+
+// ---------- 浏览器登录（粘贴）仍保持原契约 ----------
+
+test('浏览器登录仍然是 magpie 开页面 + 粘贴框', async () => {
+  const { auth } = await hooks()
+  const m = methodOf(auth, '浏览器登录')
   const a = await m.authorize({}, {})
-  // opened:false —— 交给 magpie 开在用户自己的浏览器里（网页版新标签页 / 桌面版系统浏览器）
-  assert.equal(a.opened, false)
-  // method:'code' —— 界面因此会给出一个输入框和提交按钮
+  assert.equal(a.opened, false, 'opened 必须是 false，登录页才会由 magpie 开在用户浏览器里')
   assert.equal(a.method, 'code')
   assert.equal(a.url, LOGIN_PAGE_URL)
   assert.match(a.instructions, /document\.cookie/)
   assert.equal(typeof a.callback, 'function')
 })
 
-test('粘贴有效 Cookie 存成会话凭据', async () => {
+test('粘贴有效 Cookie 存成账号，但不写 expires（没有凭据可续期）', async () => {
   const { auth } = await hooks()
-  const m = auth.methods[0]
+  const m = methodOf(auth, '浏览器登录')
   const a = await m.authorize({}, {})
-
-  const s = stubFetch({ status: 200, body: { credits: 12 } })
+  const s = stubFetch([[isSummary, { body: { credits: 12 } }]])
   try {
-    const auth0 = await a.callback('cookie: sid=abc; theme=dark')
-    assert.equal(auth0.type, 'success')
-    // normalizeCookie 会剥掉 DevTools 里连 "cookie:" 一起复制进来的前缀
-    assert.equal(auth0.access, 'sid=abc; theme=dark')
-    assert.equal(auth0.metadata.cookie, 'sid=abc; theme=dark')
-    assert.ok(auth0.expires > Date.now())
-    // 真的把 cookie 发去校验了，而不是闭眼存下
-    assert.equal(s.calls.length, 1)
-    assert.match(s.calls[0].url, /\/api\/credits\/summary$/)
-    assert.equal(s.calls[0].headers.cookie, 'sid=abc; theme=dark')
+    const cred = await a.callback('cookie: sid=abc; theme=dark')
+    assert.equal(cred.type, 'success')
+    assert.equal(cred.access, 'sid=abc; theme=dark')
+    assert.equal(cred.metadata.cookie, 'sid=abc; theme=dark')
+    // 有 expires 宿主就会去调 refresh，而粘贴来的账号没有 refresh token
+    assert.equal('expires' in cred, false)
+    assert.equal(cred.refresh, '', 'refresh 字段必须存在，否则宿主不会存成 oauth 账号')
   } finally {
     s.restore()
   }
 })
 
-test('粘贴的 Cookie 无效时抛错，界面才会显示原因', async () => {
+test('粘贴的 Cookie 无效时抛错', async () => {
   const { auth } = await hooks()
-  const a = await auth.methods[0].authorize({}, {})
-
-  const s = stubFetch({ status: 401, body: { message: 'unauthenticated' } })
+  const a = await methodOf(auth, '浏览器登录').authorize({}, {})
+  const s = stubFetch([[isSummary, { status: 401, body: {} }]])
   try {
     await assert.rejects(() => a.callback('sid=stale'), /无效|过期/)
   } finally {
@@ -83,9 +247,8 @@ test('粘贴的 Cookie 无效时抛错，界面才会显示原因', async () => 
 
 test('粘贴空内容时直接拒绝，不打网络', async () => {
   const { auth } = await hooks()
-  const a = await auth.methods[0].authorize({}, {})
-
-  const s = stubFetch({ status: 200 })
+  const a = await methodOf(auth, '浏览器登录').authorize({}, {})
+  const s = stubFetch([[isSummary, { status: 200 }]])
   try {
     await assert.rejects(() => a.callback('   '), /Cookie/)
     assert.equal(s.calls.length, 0)
@@ -94,13 +257,10 @@ test('粘贴空内容时直接拒绝，不打网络', async () => {
   }
 })
 
-// Application → Cookies 表格整块复制出来是制表符分隔的，不是 Cookie 头。
-// 这条错误最容易发生（DevTools 里 Ctrl+A/Ctrl+C 就是它），提示必须指对地方。
 test('从 Cookies 表格整块复制的内容会被认出来并指路', async () => {
   const { auth } = await hooks()
-  const a = await auth.methods[0].authorize({}, {})
-
-  const s = stubFetch({ status: 200 })
+  const a = await methodOf(auth, '浏览器登录').authorize({}, {})
+  const s = stubFetch([[isSummary, { status: 200 }]])
   try {
     await assert.rejects(() => a.callback('sid\tabc\tbreezeblue.ai\t/\t2027-01-01'), /制表符|换行/)
     assert.equal(s.calls.length, 0)
@@ -111,15 +271,15 @@ test('从 Cookies 表格整块复制的内容会被认出来并指路', async ()
 
 test('本机自动模式标记 opened:true，避免 magpie 再开第二个窗口', async () => {
   const { auth } = await hooks()
-  const m = auth.methods[1]
-  const ctx = { signal: { aborted: true } }
-  const a = await m.authorize({}, ctx)
+  const m = methodOf(auth, '本机自动')
+  const a = await m.authorize({}, { signal: { aborted: true } })
   assert.equal(a.opened, true)
   assert.equal(a.method, 'auto')
-  // signal 已中止，callback 应当拿到一个失败结果而不是炸掉宿主
   const r = await a.callback()
   assert.equal(r.type, 'failed')
 })
+
+// ---------- 签到 ----------
 
 test('checkin 对只有 API key 的账号给出可照做的提示', async () => {
   const { auth } = await hooks()
@@ -130,7 +290,8 @@ test('checkin 对只有 API key 的账号给出可照做的提示', async () => 
 
 test('checkin 用会话 cookie 领取，401 变成需要重新登录', async () => {
   const { auth } = await hooks()
-  const good = stubFetch({ status: 200, body: { credit: 30 } })
+  // 领取打的是 daily-claim（POST），summary 只是登录时验一次 cookie，别搞混。
+  const good = stubFetch([[isClaim, { body: { ok: true, credit: 30 } }]])
   try {
     const r = await auth.checkin(async () => ({ type: 'success', access: 'sid=ok', metadata: { cookie: 'sid=ok' } }))
     assert.equal(r.outcome, 'claimed')
@@ -139,10 +300,10 @@ test('checkin 用会话 cookie 领取，401 变成需要重新登录', async () 
     good.restore()
   }
 
-  const bad = stubFetch({ status: 401, body: {} })
+  const bad = stubFetch([[isClaim, { status: 401, body: {} }]])
   try {
     const r = await auth.checkin(async () => ({ type: 'success', access: 'sid=old' }))
-    // 不能用 failed：那会让宿主当天每 30 分钟重试一次，直到把账号锁死
+    // 不能用 failed：那会让宿主当天每 30 分钟重试一次
     assert.equal(r.signIn, 'expired')
   } finally {
     bad.restore()

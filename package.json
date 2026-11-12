@@ -1,7 +1,7 @@
 {
   "name": "magpie-breeze-blue",
-  "version": "0.6.0",
-  "description": "Breeze Blue TTS provider plugin for Magpie: browser login for the web session (works on a NAS or in Docker) and daily credit check-in",
+  "version": "0.7.0",
+  "description": "Breeze Blue TTS provider plugin for Magpie: email/password sign-in with auto-renewal for the web session, a paste-once browser login for NAS/Docker, and daily credit check-in",
   "type": "module",
   "main": "./index.mjs",
   "files": [
@@ -39,8 +39,8 @@
   "magpie": {
     "name": "BreezeBlue",
     "summary": {
-      "en": "Breeze Blue text-to-speech with daily credit check-in. The sign-in page opens in your own browser, so it works on a NAS or in Docker too.",
-      "zh": "Breeze Blue 文本转语音，附带每日积分自动领取。登录页开在你自己的浏览器里，装在 NAS / Docker 上同样可用。"
+      "en": "Breeze Blue text-to-speech with daily credit check-in. Sign in with email and password (no browser, auto-renewed) or paste a cookie once — works on a NAS or in Docker.",
+      "zh": "Breeze Blue 文本转语音，附带每日积分自动领取。可直接填邮箱密码登录（不用浏览器、自动续期），装在 NAS / Docker 上同样可用。"
     },
     "icon": "https://breezeblue.ai/favicon.png"
   }

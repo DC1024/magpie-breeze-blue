@@ -1,13 +1,15 @@
 // Magpie 的 Breeze Blue provider 插件接线：config/auth/provider 三个 hook，
 // 具体的请求映射与 HTTP 逻辑都在 lib/breeze.mjs。
-// 每日签到（auth.checkin）走的是 Web 端会话 cookie，逻辑在 lib/checkin.mjs，
-// 浏览器取 cookie 的流程在 lib/browser-login.mjs。
+// 每日签到（auth.checkin）走的是 Web 端会话 cookie，逻辑在 lib/checkin.mjs。
 //
-// 登录页由谁打开：magpie 自己。网页版前端是 window.open(url) 开新标签页
-// （internal/gui/assets/app.js 的 openSignInPage），桌面版调系统浏览器
-// （internal/gui/api.go 的 openSignIn）。所以 authorize 只要把地址交回去，
-// 页面就开在**用户自己的电脑**上——插件不需要 spawn 浏览器，也不需要隧道。
-// 这一点是 v0.6.0 的修正：v0.5.0 以为「宿主不管浏览器」，白造了一套 SSH 隧道。
+// 三条拿会话的路径：
+//   1. 邮箱密码（lib/password-login.mjs）：Firebase 直连换 idToken，再换 Breeze 会话。
+//      不开浏览器、不用复制，且能靠 refresh token 长期续期。首选。
+//   2. 浏览器登录：magpie 打开登录页（网页版 window.open(url)，桌面版系统浏览器，
+//      见 internal/gui/assets/app.js 的 openSignInPage 与 internal/gui/api.go 的
+//      openSignIn），用户登录后把 cookie 粘回来。站点性质决定它只能这样。
+//   3. 本机自动读 Cookie（lib/browser-login.mjs）：Magpie 与浏览器同机时走 CDP，
+//      不用复制。跨机时 spawn 的窗口开在 NAS 的屏幕上，没用。
 import {
   BALANCE_PLAN,
   BREEZE_BASE_URL,
@@ -16,6 +18,7 @@ import {
 } from './lib/breeze.mjs'
 import { claimDailyCredits, normalizeCookie, verifyCookie } from './lib/checkin.mjs'
 import { LOGIN_PAGE_URL, loginWithBrowser } from './lib/browser-login.mjs'
+import { loginWithPassword, renewSession } from './lib/password-login.mjs'
 
 const PROVIDER_ID = 'breeze'
 const MODEL_ID = 'breeze-tts-2'
@@ -25,15 +28,22 @@ function resolveCheckinCookie(auth) {
   return normalizeCookie(auth?.metadata?.cookie ?? auth?.cookie ?? auth?.access ?? '')
 }
 
-// 登录成功后交给 Magpie 的凭据形状。expires 只是让宿主别主动淘汰；
-// 真正的判据是上游 401，届时 checkin 会返回 signIn: "expired"。
-function cookieCredential(cookie) {
+// 登录成功后交给 Magpie 的凭据形状。
+// 必须带 refresh 字段（哪怕是空串）：宿主 save() 靠 `"refresh" in result` 判断
+// 这该存成 oauth 账号，少了它整条登录会被静默丢弃。
+//
+// 两种形状的区别在 expires：
+//   - 只有 cookie（粘贴 / CDP）：不写 expires。宿主的 renewAt() 只对有 expires 的
+//     oauth 账号续期，没有就永不续期——这正确，因为没有 refresh token 可续。
+//   - 邮箱密码登录：写 expires + 真的 refresh token，宿主到点自动续期。
+function cookieCredential(cookie, extra = {}) {
+  const { expires, refresh, metadata } = extra
   return {
     type: 'success',
     access: cookie,
-    refresh: '',
-    expires: Date.now() + 360 * 24 * 3600 * 1000,
-    metadata: { cookie },
+    refresh: refresh ?? '',
+    ...(expires ? { expires } : {}),
+    metadata: { cookie, ...(metadata ?? {}) },
   }
 }
 
@@ -136,13 +146,68 @@ export default async function breezePlugin() {
     auth: {
       provider: PROVIDER_ID,
       methods: [
-        // ── 主路径：magpie 开登录页 + 粘贴框。
+        // ── 首选：邮箱密码。全程在插件进程里打 HTTP，不开浏览器、不用复制、
+        // 还能靠 Firebase 的 refresh token 长期续期（见下面的 refresh 钩子）。
+        // authorize 里就把活干完（3 个请求，几秒），失败直接 throw，宿主会把
+        // 原因显示在登录卡片上；成功则 callback 立刻交出凭据，界面一闪而过。
+        {
+          type: 'oauth',
+          label: '邮箱密码登录（推荐，不用浏览器）',
+          prompts: [
+            {
+              type: 'text',
+              key: 'email',
+              message: 'Breeze 账号邮箱',
+              placeholder: 'you@example.com',
+              validate: (value) => (String(value ?? '').includes('@') ? undefined : '填一个完整的邮箱地址'),
+            },
+            {
+              // magpie 自己的 prompt 类型（OpenCode 只有 text/select），界面是掩码框
+              type: 'password',
+              key: 'password',
+              message: 'Breeze 账号密码',
+              placeholder: '只在登录这一刻用到，不写盘',
+              validate: (value) => (String(value ?? '').trim() ? undefined : '请输入密码'),
+            },
+          ],
+          async authorize(inputs) {
+            const result = await loginWithPassword({
+              email: inputs?.email,
+              password: inputs?.password,
+              verify: async (cookie) => (await verifyCookie(cookie)).ok,
+              log: (line) => console.error(`[breeze] ${line}`),
+            })
+            // 失败只能 throw：return { type: 'failed' } 在老版本宿主上会被当成
+            // 登录流程去调 .callback()，报「gave nothing to finish it with」。
+            if (!result.ok) throw new Error(result.error)
+
+            return {
+              // 没有页面要开：url 留空，前端就不会 window.open，也不会渲染链接
+              url: '',
+              instructions: `已登录 ${result.user}`,
+              method: 'auto',
+              opened: true,
+              async callback() {
+                return cookieCredential(result.cookie, {
+                  expires: result.expiresAt,
+                  refresh: result.refreshToken,
+                  metadata: {
+                    firebaseRefreshToken: result.refreshToken,
+                    apiKey: result.apiKey,
+                    user: result.user,
+                  },
+                })
+              },
+            }
+          },
+        },
+        // ── 主路径（免密码）：magpie 开登录页 + 粘贴框。
         // method: 'code' 让界面在 instructions 下面直接给一个输入框和一个提交按钮，
         // 用户粘完点一下就好；宿主把这段文本原样交回 callback(code)。
         // 这条路径不依赖 Magpie 与本机的任何能力，NAS / Docker / 远程访问全都能用。
         {
           type: 'oauth',
-          label: '浏览器登录（推荐）',
+          label: '浏览器登录（打开登录页，粘一次 Cookie）',
           async authorize() {
             return {
               // opened: false —— 交给 magpie 打开（网页版开新标签页，桌面版调系统浏览器）
@@ -212,7 +277,49 @@ export default async function breezePlugin() {
             }
           },
         },
+        {
+          // 只做 TTS 的人用这条：api.breeze.blue 认的是 xi-api-key，跟网页会话
+          // 完全是两套东西。凭证存成 api 类型，loader 从 auth.key 取。
+          // （e42ca41 重构时误删过这一条，会让 TTS 无 key 可用，别再去掉。）
+          type: 'api',
+          label: 'Breeze API key（只做 TTS / 查余额时用）',
+          placeholder: 'brz_…',
+        },
       ],
+
+      // 宿主到点（expires - 5 分钟）会调这个，也在 checkin / usage 之前按需调。
+      // 只有邮箱密码登录的账号带 refresh token；粘贴 / CDP 来的 cookie 没有
+      // expires，宿主根本不会调到这里。
+      //
+      // 返回的字段会覆盖旧凭据（type 由宿主强制成 oauth）。抛异常时带
+      // signIn: 'expired' 表示「彻底没救了」，宿主会把账号标成需要重新登录；
+      // 不带就只是这次续期失败，退避后再试。
+      async refresh(auth) {
+        const refreshToken = String(auth?.refresh ?? auth?.metadata?.firebaseRefreshToken ?? '').trim()
+        if (!refreshToken) return undefined
+
+        const result = await renewSession({
+          refreshToken,
+          verify: async (cookie) => (await verifyCookie(cookie)).ok,
+        })
+        if (!result.ok) {
+          const error = new Error(result.error ?? '续期失败')
+          if (result.expired) error.signIn = 'expired'
+          throw error
+        }
+
+        return {
+          access: result.cookie,
+          refresh: result.refreshToken,
+          expires: result.expiresAt,
+          metadata: {
+            ...(auth?.metadata ?? {}),
+            cookie: result.cookie,
+            firebaseRefreshToken: result.refreshToken,
+            apiKey: result.apiKey,
+          },
+        }
+      },
 
       async loader(getAuth) {
         let auth
