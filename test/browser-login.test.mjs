@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  GOOGLE_BLOCKED_MESSAGE,
+  LAUNCH_ARGS,
   chromiumCandidates,
   cookiesToHeader,
   findChromium,
@@ -504,6 +506,72 @@ test('loginWithBrowser 有 DISPLAY 的 Linux 仍走本地模式', async () => {
     // 浏览器没写 DevToolsActivePort，所以是端口超时
     assert.match(result.error, /调试端口|超时/)
   } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// 回归：Chrome 157 实测只要开 --remote-debugging-port，即使没有 --enable-automation，
+// 页面里的 navigator.webdriver 也是 true —— Google 的「此浏览器或应用可能不安全」
+// 读的就是这个信号，用户会在登录页直接卡死。这条断言守住那个抑制标志。
+test('启动参数里必须带 AutomationControlled 抑制标志', () => {
+  const flag = LAUNCH_ARGS.find((a) => a.startsWith('--disable-blink-features='))
+  assert.ok(flag, `LAUNCH_ARGS 里缺抑制 webdriver 的标志：${LAUNCH_ARGS.join(' ')}`)
+  // 以后要关别的 blink 特性时，别把这个写丢了（写丢了 Google 登录就又废）
+  assert.match(flag, /AutomationControlled/)
+  // 反过来：绝不能自己把自动化开关打开
+  assert.ok(!LAUNCH_ARGS.includes('--enable-automation'))
+})
+
+test('loginWithBrowser 撞上 Google 拦截时快速报错，不等满超时', async () => {
+  const dir = tempProfile()
+  const portFile = join(dir, 'DevToolsActivePort')
+  const realWebSocket = globalThis.WebSocket
+
+  class FakeSocket {
+    constructor() {
+      setTimeout(() => {
+        this.onopen?.()
+        this.onmessage?.({
+          data: JSON.stringify({
+            id: 1,
+            result: { cookies: [{ name: 'sid', value: 'stale', domain: 'breezeblue.ai', path: '/' }] },
+          }),
+        })
+      }, 0)
+    }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = FakeSocket
+
+  try {
+    const startedAt = Date.now()
+    const result = await loginWithBrowser({
+      exists: () => true,
+      platform: 'win32',
+      env: {},
+      dir,
+      timeoutMs: 30000,
+      pollMs: 50,
+      googleGraceMs: 300,
+      spawnImpl: () => {
+        writeFileSync(portFile, '19334\n/devtools/browser/x\n')
+        return { kill: () => {} }
+      },
+      // 浏览器停在 Google 账号页 = 正在被「不安全浏览器」挡住
+      httpGet: async () => [
+        { type: 'page', url: 'https://accounts.google.com/v3/signin/identifier?continue=x', webSocketDebuggerUrl: 'ws://x' },
+      ],
+      verify: async () => false,
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.error, GOOGLE_BLOCKED_MESSAGE)
+    // 必须在超时（30s）之前就放弃，并且要给出可照做的替代路径
+    assert.ok(Date.now() - startedAt < 5000, '应该在 Google 拦截上快速失败')
+    assert.match(result.error, /邮箱密码登录/)
+    assert.match(result.error, /浏览器登录/)
+  } finally {
+    globalThis.WebSocket = realWebSocket
     rmSync(dir, { recursive: true, force: true })
   }
 })

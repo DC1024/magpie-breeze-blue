@@ -238,7 +238,8 @@ export default async function breezePlugin() {
           label: '本机自动读 Cookie（Magpie 与浏览器在同一台电脑）',
           url: LOGIN_PAGE_URL,
           instructions:
-            '已打开一个独立的 Breeze 登录窗口：登录完成后会自动读取登录态，无需复制任何东西。成功后窗口会自己关掉。',
+            '已打开一个独立的 Breeze 登录窗口：登录完成后会自动读取登录态，无需复制任何东西。成功后窗口会自己关掉。'
+            + '若页面提示「此浏览器或应用可能不安全」，那是 Google 拦了插件开的浏览器，请改用「邮箱密码登录」，或关掉窗口用「浏览器登录」。',
           // 窗口是插件自己开的，别让宿主再开第二个
           opened: true,
           run: ({ signal }) =>
