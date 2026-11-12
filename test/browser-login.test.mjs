@@ -359,7 +359,7 @@ test('findChromium 优先用 MAGPIE_BREEZE_BROWSER 指定的绝对路径', () =>
   assert.equal(found, '/custom/chrome')
 })
 
-// ---------- 远程模式（Magpie 装在 NAS / 服务器，浏览器在用户自己电脑上）----------
+// ---------- CDP 读取（本机自动模式与调试端口都用这一层）----------
 
 test('normalizeCdpBase 接受多种写法', () => {
   assert.equal(normalizeCdpBase('127.0.0.1:9222'), 'http://127.0.0.1:9222')
@@ -373,8 +373,8 @@ test('normalizeCdpBase 接受多种写法', () => {
   assert.equal(normalizeCdpBase('http://'), '')
 })
 
-// 走 SSH 隧道时，浏览器自报的 ws 地址是它自己视角的 127.0.0.1:9222，
-// 插件这边必须换成隧道端口，否则连的是本机（不存在）的 9222。
+// 浏览器自报的 ws 地址是它自己视角的地址，插件必须换成实际连得上的那个，
+// 否则会去连一个对本进程不可达的端口。
 test('rewriteWsUrl 把浏览器自报的 host:port 换成实际可达地址', () => {
   assert.equal(
     rewriteWsUrl('ws://127.0.0.1:9222/devtools/browser/abc', 'http://127.0.0.1:19222'),
@@ -467,76 +467,6 @@ test('readCookiesViaCdp 老浏览器不支持 Storage 时退回页面级 getAllC
   }
 })
 
-// 远程模式的核心：绝不能去 spawn 浏览器。
-// NAS 上 spawn 出来的窗口开在 NAS 自己的显示器上，用户看不到，等于必然失败。
-test('loginWithBrowser 传 cdpUrl 时不启动浏览器', async () => {
-  const realWebSocket = globalThis.WebSocket
-  let spawnCalls = 0
-  class FakeSocket {
-    constructor() {
-      setTimeout(() => this.onopen?.(), 0)
-    }
-    send() {
-      setTimeout(() => {
-        this.onmessage?.({
-          data: JSON.stringify({
-            id: 1,
-            result: { cookies: [{ name: 'sid', value: 'ok', domain: '.breezeblue.ai', path: '/' }] },
-          }),
-        })
-      }, 0)
-    }
-    close() {}
-  }
-  globalThis.WebSocket = FakeSocket
-  try {
-    const result = await loginWithBrowser({
-      cdpUrl: '127.0.0.1:19222',
-      // 即使这里有可用的浏览器也不该用
-      exists: () => true,
-      platform: 'win32',
-      env: { ProgramFiles: 'C://PF' },
-      timeoutMs: 4000,
-      pollMs: 100,
-      spawnImpl: () => {
-        spawnCalls += 1
-        return { kill: () => {} }
-      },
-      httpGet: async (url) => {
-        if (url.endsWith('/json/version')) return { Browser: 'Chrome/157', webSocketDebuggerUrl: 'ws://x/1' }
-        throw new Error('should not be called')
-      },
-      verify: async () => true,
-    })
-    assert.equal(spawnCalls, 0, '远程模式不该启动浏览器')
-    assert.equal(result.ok, true)
-    assert.equal(result.cookie, 'sid=ok')
-    assert.equal(result.browser, 'http://127.0.0.1:19222')
-  } finally {
-    globalThis.WebSocket = realWebSocket
-  }
-})
-
-test('loginWithBrowser 远程模式连不上时给出排查步骤', async () => {
-  const result = await loginWithBrowser({
-    cdpUrl: '127.0.0.1:19222',
-    timeoutMs: 600,
-    pollMs: 100,
-    httpGet: async () => null,
-    spawnImpl: () => ({ kill: () => {} }),
-  })
-  assert.equal(result.ok, false)
-  assert.match(result.error, /连不上/)
-  assert.match(result.error, /remote-debugging-port/)
-  assert.match(result.error, /隧道/)
-})
-
-test('loginWithBrowser 远程模式地址非法时直接拒绝', async () => {
-  const result = await loginWithBrowser({ cdpUrl: 'http://', timeoutMs: 500 })
-  assert.equal(result.ok, false)
-  assert.match(result.error, /调试地址格式/)
-})
-
 // Linux 上没有 DISPLAY 时浏览器起来就退，窗口画不出来。
 // 与其让用户盯着 5 分钟超时，不如立刻告诉他该怎么做。
 test('loginWithBrowser 在无图形界面的 Linux 上直接给出替代方案', async () => {
@@ -551,7 +481,7 @@ test('loginWithBrowser 在无图形界面的 Linux 上直接给出替代方案',
   })
   assert.equal(result.ok, false)
   assert.match(result.error, /图形界面|DISPLAY/)
-  assert.match(result.error, /远程|粘贴 Cookie/)
+  assert.match(result.error, /浏览器登录|粘贴 Cookie/)
 })
 
 test('loginWithBrowser 有 DISPLAY 的 Linux 仍走本地模式', async () => {
