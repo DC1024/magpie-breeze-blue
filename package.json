@@ -1,6 +1,6 @@
 {
   "name": "magpie-breeze-blue",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Breeze Blue TTS provider plugin for Magpie: email/password sign-in with auto-renewal for the web session, a paste-once browser login for NAS/Docker, and daily credit check-in",
   "type": "module",
   "main": "./index.mjs",

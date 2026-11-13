@@ -8,6 +8,85 @@ import {
   parseClaimPayload,
 } from '../lib/checkin.mjs'
 
+test('真实领取响应解析 credits_issued 和供应商重置时间', async () => {
+  const until = '2026-11-14T00:00:00+00:00'
+  const result = await claimDailyCredits({
+    cookie: COOKIE,
+    fetchImpl: async () => jsonResponse(200, {
+      claimed: true, already_claimed: false, credits_issued: 400,
+      balance: 3090.9, daily_claim_claimed_today: true,
+      daily_claim_next_reset_at: until,
+    }),
+  })
+  assert.equal(result.outcome, 'claimed')
+  assert.equal(result.credit, 400)
+  assert.equal(result.until, new Date(until).toISOString())
+})
+
+test('already_claimed 布尔标记映射 done，保留重置时间', async () => {
+  const result = await claimDailyCredits({
+    cookie: COOKIE,
+    fetchImpl: async () => jsonResponse(200, {
+      claimed: false, already_claimed: true, credits_issued: 0,
+      daily_claim_next_reset_at: '2026-11-14T00:00:00Z',
+    }),
+  })
+  assert.equal(result.outcome, 'done')
+  assert.equal(result.credit, undefined)
+  assert.equal(result.until, '2026-11-14T00:00:00.000Z')
+})
+
+test('claimed:false 不能被 HTTP 200 覆盖成成功', async () => {
+  const result = await claimDailyCredits({ cookie: COOKIE,
+    fetchImpl: async () => jsonResponse(200, { claimed: false, already_claimed: false }),
+  })
+  assert.equal(result.outcome, 'failed')
+})
+
+test('跨日错位：北京 00:30 网站还停在昨天，不能报成今天已签', async () => {
+  // 北京 11-13 00:30 = UTC 11-12 16:30；网站这一天到 11-13T00:00Z（北京 08:00）才结束
+  const now = Date.parse('2026-11-12T16:30:00Z')
+  const result = await claimDailyCredits({
+    cookie: COOKIE, now,
+    fetchImpl: async () => jsonResponse(200, {
+      claimed: false, already_claimed: true, credits_issued: 0,
+      daily_claim_claimed_today: true,
+      daily_claim_next_reset_at: '2026-11-13T00:00:00Z',
+    }),
+  })
+  // 报 done 会让界面显示「已签到」却没有 +N，用户看到的就是「说签了但没领」
+  assert.equal(result.outcome, 'inactive')
+  assert.equal(result.until, '2026-11-13T00:00:00.000Z', '要等到网站日切再问')
+  assert.match(result.message, /08:00/)
+})
+
+test('北京 08:00 之后网站已日切，同样的响应才是真的今天已领', async () => {
+  const now = Date.parse('2026-11-13T00:30:00Z') // 北京 08:30
+  const result = await claimDailyCredits({
+    cookie: COOKIE, now,
+    fetchImpl: async () => jsonResponse(200, {
+      claimed: false, already_claimed: true, credits_issued: 0,
+      daily_claim_next_reset_at: '2026-11-14T00:00:00Z',
+    }),
+  })
+  assert.equal(result.outcome, 'done')
+  assert.equal(result.until, '2026-11-14T00:00:00.000Z')
+})
+
+test('领到积分时 until 指向下一次重置，当天不再重复问', async () => {
+  const now = Date.parse('2026-11-13T01:00:00Z') // 北京 09:00
+  const result = await claimDailyCredits({
+    cookie: COOKIE, now,
+    fetchImpl: async () => jsonResponse(200, {
+      claimed: true, already_claimed: false, credits_issued: 400,
+      daily_claim_next_reset_at: '2026-11-14T00:00:00Z',
+    }),
+  })
+  assert.equal(result.outcome, 'claimed')
+  assert.equal(result.credit, 400)
+  assert.equal(result.until, '2026-11-14T00:00:00.000Z')
+})
+
 const COOKIE = 'session=abc123; other=xyz'
 
 function jsonResponse(status, body) {
@@ -73,12 +152,12 @@ test('嵌套在 data 里的字段也能取到', () => {
   assert.equal(parsed.streak, 7)
 })
 
-test('2xx 但字段未知时仍报 claimed，不编造 credit', async () => {
+test('2xx 但字段未知时不谎报领取成功', async () => {
   const result = await claimDailyCredits({
     cookie: COOKIE,
     fetchImpl: async () => jsonResponse(200, { ok: true }),
   })
-  assert.equal(result.outcome, 'claimed')
+  assert.equal(result.outcome, 'failed')
   assert.equal(result.credit, undefined)
 })
 
@@ -122,12 +201,12 @@ test('网络异常报 failed 且带上原因', async () => {
   assert.match(result.message, /ECONNRESET/)
 })
 
-test('非 JSON 的 2xx 仍视为 claimed', async () => {
+test('非 JSON 的 2xx 不谎报成功', async () => {
   const result = await claimDailyCredits({
     cookie: COOKIE,
     fetchImpl: async () => new Response('', { status: 200 }),
   })
-  assert.equal(result.outcome, 'claimed')
+  assert.equal(result.outcome, 'failed')
 })
 
 test('返回值里不泄漏 cookie', async () => {

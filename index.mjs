@@ -16,7 +16,7 @@ import {
   breezeBalance,
   createBreezeSpeechFetch,
 } from './lib/breeze.mjs'
-import { claimDailyCredits, normalizeCookie, verifyCookie } from './lib/checkin.mjs'
+import { claimDailyCredits, normalizeCookie, verifyCookie, webCreditsUsage } from './lib/checkin.mjs'
 import { LOGIN_PAGE_URL, loginWithBrowser } from './lib/browser-login.mjs'
 import { loginWithPassword, renewSession } from './lib/password-login.mjs'
 
@@ -343,27 +343,11 @@ export default async function breezePlugin() {
       async usage(getAuth) {
         try {
           const auth = await getAuth()
+          const cookie = resolveCheckinCookie(auth)
+          if (cookie) return await webCreditsUsage({ cookie })
           const key = typeof auth?.key === 'string' ? auth.key.trim() : ''
-          if (!key) {
-            const hasCookie = Boolean(resolveCheckinCookie(auth))
-            return {
-              plan: BALANCE_PLAN,
-              windows: hasCookie
-                ? [{ name: '每日积分', display: '由每日签到自动领取', aside: true }]
-                : [],
-              error: hasCookie ? undefined : '未配置 Breeze API key，余额不可查',
-            }
-          }
-
-          const usage = await breezeBalance(key)
-          if (Array.isArray(usage.windows) && usage.windows.length > 0) {
-            usage.windows.push({
-              name: '每日积分',
-              display: '由每日签到自动领取',
-              aside: true,
-            })
-          }
-          return usage
+          if (key) return await breezeBalance(key)
+          return { plan: BALANCE_PLAN, windows: [], error: '请登录 Breeze 网页账号或配置 API key 后查询积分' }
         } catch (error) {
           return {
             plan: BALANCE_PLAN,

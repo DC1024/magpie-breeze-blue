@@ -279,6 +279,35 @@ test('本机自动模式标记 opened:true，避免 magpie 再开第二个窗口
   assert.equal(r.type, 'failed')
 })
 
+test('网页登录账号直接读取真实剩余积分和今日领取状态', async () => {
+  const { auth } = await hooks()
+  const s = stubFetch([[isSummary, { body: {
+    balance: 3090.9, daily_claim_amount: 400, daily_claim_claimed_today: true,
+    daily_claim_next_reset_at: '2026-11-14T00:00:00Z',
+  } }]])
+  try {
+    const r = await auth.usage(async () => ({ type: 'oauth', access: 'sid=ok' }))
+    assert.equal(r.windows[0].balance, 3090.9)
+    assert.equal(r.windows[0].unit, '积分')
+    assert.match(r.windows[1].display, /已领取.*400/)
+    assert.match(r.windows[2].display, /08:00:00/)
+    assert.equal(s.calls.length, 1)
+  } finally { s.restore() }
+})
+
+test('零积分是有效余额，未领取时显示可领取，查询不触发领取', async () => {
+  const { auth } = await hooks()
+  const s = stubFetch([[isSummary, { body: {
+    balance: 0, daily_claim_amount: 100, daily_claim_available: true, daily_claim_claimed_today: false,
+  } }]])
+  try {
+    const r = await auth.usage(async () => ({ type: 'oauth', access: 'sid=ok' }))
+    assert.equal(r.windows[0].balance, 0)
+    assert.match(r.windows[1].display, /可领取.*100/)
+    assert.equal(s.calls[0].method, 'GET')
+  } finally { s.restore() }
+})
+
 // ---------- 签到 ----------
 
 test('checkin 对只有 API key 的账号给出可照做的提示', async () => {
